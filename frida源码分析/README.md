@@ -301,31 +301,85 @@ frida-java使用Java.use来获得java类的class引用，Java.use(className),返
     //添加该类特有的函数和属性
 ```
 
+#### frida-java-bridge art hook原理
+
+常见的ART Hook方法为：替换方法的入口点，即ArtMethod的entry_point_from_quick_compiled*code*，并将原方法的信息备份到entry_point_from*jni*。替换后的入口点，会重新准备栈和寄存器，执行hook的方法。
+
+ 
+
+frida-java采用的hook方法，其原理为：首先将方法native化，然后将ArtMethod的entry_point_from*jni*替换为hook的方法，并将entry_point_from_quick_compiled*code*替换为art_quick_generic_jni_trampoline。当调用被hook的方法时，首先会跳转到art_quick_generic_jni_trampoline，该函数会做一些jni调用的准备，然后跳转到ArtMethod结构的entry_point_from*jni*所指向的hook方法，这样就完成了一次hook。完成art hook的源码如下：
+
+```javascript
+replace (impl, isInstanceMethod, argTypes, vm, api) {
+    this.originalMethod = fetchArtMethod(this.methodId, vm);
+
+    const originalFlags = this.originalMethod.accessFlags;
+
+    if ((originalFlags & kAccXposedHookedMethod) !== 0 && xposedIsSupported()) {
+      const hookInfo = this.originalMethod.jniCode;
+      this.hookedMethodId = hookInfo.add(2 * pointerSize).readPointer();
+      this.originalMethod = fetchArtMethod(this.hookedMethodId, vm);
+    }
+
+    const { hookedMethodId } = this;
+
+    const replacementMethodId = cloneArtMethod(hookedMethodId, vm);
+    this.replacementMethodId = replacementMethodId;
+
+    patchArtMethod(replacementMethodId, {
+      jniCode: impl,
+      accessFlags: ((originalFlags & ~(kAccCriticalNative | kAccFastNative | kAccNterpEntryPointFastPathFlag)) | kAccNative) >>> 0,
+      quickCode: api.artClassLinker.quickGenericJniTrampoline,
+      interpreterCode: api.artInterpreterToCompiledCodeBridge
+    }, vm);
+
+    // Remove kAccFastInterpreterToInterpreterInvoke and kAccSkipAccessChecks to disable use_fast_path
+    // in interpreter_common.h
+    let hookedMethodRemovedFlags = kAccFastInterpreterToInterpreterInvoke | kAccSingleImplementation | kAccNterpEntryPointFastPathFlag;
+    if ((originalFlags & kAccNative) === 0) {
+      hookedMethodRemovedFlags |= kAccSkipAccessChecks;
+    }
+
+    patchArtMethod(hookedMethodId, {
+      accessFlags: (originalFlags & ~(hookedMethodRemovedFlags)) >>> 0
+    }, vm);
+
+    const quickCode = this.originalMethod.quickCode;
+
+    // Replace Nterp quick entrypoints with art_quick_to_interpreter_bridge to force stepping out
+    // of ART's next-generation interpreter and use the quick stub instead.
+    const { artNterpEntryPoint } = api;
+
+    if (artNterpEntryPoint !== undefined && quickCode.equals(artNterpEntryPoint)) {
+      patchArtMethod(hookedMethodId, {
+        quickCode: api.artQuickToInterpreterBridge
+      }, vm);
+    }
+
+    if (!isArtQuickEntrypoint(quickCode)) {
+      const interceptor = new ArtQuickCodeInterceptor(quickCode);
+      interceptor.activate(vm);
+
+      this.interceptor = interceptor;
+    }
+
+    artController.replacedMethods.set(hookedMethodId, replacementMethodId);
+
+    notifyArtMethodHooked(hookedMethodId, vm);
+  }
+```
+
+
+
+
+
+
+
 ### frida-gum原码分析
 
 在此只分析最重要的`interceptor`这种hook方式(inline hook)
 
-核心在gum那个目录下
 
-gum
-├── arch-arm
-├── arch-arm64
-├── arch-mips
-├── arch-x86
-├── backend-arm
-├── backend-arm64
-├── backend-darwin
-├── backend-dbghelp
-├── backend-elf
-├── backend-libdwarf
-├── backend-libunwind
-├── backend-linux
-├── backend-mips
-├── backend-posix
-├── backend-qnx
-├── backend-windows
-└── backend-x86
-....// gum下其他文件
 
 
 
